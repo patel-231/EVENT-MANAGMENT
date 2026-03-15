@@ -1,187 +1,109 @@
 /* ============================================================
-   GeoTask Service Worker — Background Geofence Monitor
-   Runs even when Chrome is minimised or screen is off.
+   GeoTask Service Worker v3
+   — Runs in background even when Chrome is minimised
+   — Shows lock-screen style OS notifications
    ============================================================ */
+const CACHE = 'geotask-v3';
 
-const SW_VERSION = 'geotask-sw-v1';
-const CHECK_INTERVAL_MS = 30000; // check every 30 s
+self.addEventListener('install',  () => self.skipWaiting());
+self.addEventListener('activate', e  => { e.waitUntil(self.clients.claim()); });
 
-/* ── Install & activate ── */
-self.addEventListener('install', () => self.skipWaiting());
-self.addEventListener('activate', e => {
-  e.waitUntil(self.clients.claim());
-  startBackgroundWatch();
-});
-
-/* ── Message bus from main page ── */
+/* ── Messages from the page ── */
 self.addEventListener('message', e => {
-  if (e.data.type === 'SYNC_TASKS') {
-    storeTasks(e.data.tasks);
-  }
-  if (e.data.type === 'START_WATCH') {
-    startBackgroundWatch();
-  }
-  if (e.data.type === 'PING') {
-    e.source && e.source.postMessage({ type: 'PONG' });
+  if (!e.data) return;
+  switch (e.data.type) {
+    case 'SYNC_TASKS': saveTasks(e.data.tasks); break;
+    case 'SYNC_POS':   savePos(e.data.lat, e.data.lng); break;
+    case 'CHECK_NOW':  doCheck(); break;
   }
 });
 
-/* ── Periodic background sync (where supported) ── */
+/* ── Periodic sync (Chrome Android supports this) ── */
 self.addEventListener('periodicsync', e => {
-  if (e.tag === 'geofence-check') {
-    e.waitUntil(doGeofenceCheck());
-  }
+  if (e.tag === 'geo-check') e.waitUntil(doCheck());
 });
 
-/* ── Push event (from server — future use) ── */
-self.addEventListener('push', e => {
-  const data = e.data ? e.data.json() : {};
-  e.waitUntil(showNotification(data.title || '📍 Location Alert', data.body || 'You have arrived!', data.taskId));
-});
-
-/* ── Notification click ── */
+/* ── Notification button clicks ── */
 self.addEventListener('notificationclick', e => {
   e.notification.close();
+  if (e.action === 'dismiss') return;
   e.waitUntil(
-    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clients => {
-      if (clients.length) return clients[0].focus();
-      return self.clients.openWindow('/');
-    })
+    self.clients.matchAll({ type:'window', includeUncontrolled:true })
+      .then(cls => cls.length ? cls[0].focus() : self.clients.openWindow('./'))
   );
 });
 
-/* ════════════════════════════════════════════
-   BACKGROUND GEOFENCE LOGIC
-════════════════════════════════════════════ */
-let watchInterval = null;
-
-function startBackgroundWatch() {
-  if (watchInterval) clearInterval(watchInterval);
-  watchInterval = setInterval(doGeofenceCheck, CHECK_INTERVAL_MS);
-}
-
-async function doGeofenceCheck() {
-  try {
-    const tasks = await getTasks();
-    if (!tasks || !tasks.length) return;
-
-    const activeTasks = tasks.filter(t => t.active);
-    if (!activeTasks.length) return;
-
-    // Get position via background geolocation if page is not focused
-    const clients = await self.clients.matchAll({ type: 'window' });
-    
-    if (clients.length === 0) {
-      // No open window — rely on last known position stored
-      const lastPos = await getLastPos();
-      if (lastPos) {
-        await checkAllFences(activeTasks, lastPos.lat, lastPos.lng);
-      }
-    }
-    // If window open, the page handles it — SW is fallback
-  } catch (err) {
-    console.error('[SW] geofence check error', err);
-  }
-}
-
-async function checkAllFences(tasks, lat, lng) {
+/* ── Core check loop ── */
+async function doCheck() {
+  const tasks = await loadTasks();
+  const pos   = await loadPos();
+  if (!tasks.length || !pos) return;
   const now = Date.now();
   let dirty = false;
-
-  for (const t of tasks) {
-    const dist = haversine(lat, lng, t.lat, t.lng);
-    const inside = dist <= t.radius;
-    const cooldown = !t.lastN || (now - t.lastN > 90000);
-
-    if (inside && cooldown && !t.inside) {
-      await showNotification(
-        '📍 ' + t.title,
-        t.desc || 'You are within ' + t.radius + 'm of this location.',
-        t.id
-      );
-      t.inside = true;
-      t.lastN = now;
-      dirty = true;
-    } else if (!inside && t.inside) {
-      t.inside = false;
-      dirty = true;
+  for (const t of tasks.filter(x => x.active)) {
+    const d    = haversine(pos.lat, pos.lng, t.lat, t.lng);
+    const cool = !t.lastN || now - t.lastN > 120000; // 2 min cooldown
+    if (d <= t.radius && cool && !t.inside) {
+      await pushNotif(t);
+      t.inside = true; t.lastN = now; dirty = true;
+    } else if (d > t.radius && t.inside) {
+      t.inside = false; dirty = true;
     }
   }
-
-  if (dirty) await storeTasks(tasks);
+  if (dirty) await saveTasks(tasks);
 }
 
-/* ════════════════════════════════════════════
-   SHOW NOTIFICATION
-════════════════════════════════════════════ */
-async function showNotification(title, body, taskId) {
-  const opts = {
+/* ── Lock-screen style notification ── */
+async function pushNotif(t) {
+  const title = '📍 ' + t.title;
+  const body  = t.desc || 'You have arrived at your saved location!';
+  await self.registration.showNotification(title, {
     body,
-    icon: '/icon-192.png',
-    badge: '/icon-96.png',
-    tag: 'geotask-' + (taskId || Date.now()),
-    renotify: true,
-    requireInteraction: true,
-    vibrate: [200, 100, 200, 100, 400],
-    data: { taskId },
+    icon:             'icon-192.png',
+    badge:            'icon-96.png',
+    tag:              'gt-' + t.id,
+    renotify:         true,
+    requireInteraction: true,          // stays on screen until dismissed
+    silent:           false,
+    vibrate:          [300, 150, 300, 150, 600],
+    data:             { taskId: t.id },
     actions: [
-      { action: 'open', title: '📋 View Task' },
-      { action: 'dismiss', title: 'Dismiss' }
+      { action: 'open',    title: '📋 Open App' },
+      { action: 'dismiss', title: '✕ Dismiss'  }
     ]
-  };
-
-  return self.registration.showNotification(title, opts);
+  });
 }
 
-/* ════════════════════════════════════════════
-   STORAGE HELPERS (IndexedDB-like via Cache API)
-════════════════════════════════════════════ */
-async function storeTasks(tasks) {
+/* ── Cache storage helpers ── */
+async function saveTasks(tasks) {
+  const c = await caches.open(CACHE);
+  await c.put('/~tasks', new Response(JSON.stringify(tasks),
+    { headers: { 'Content-Type': 'application/json' } }));
+}
+async function loadTasks() {
   try {
-    const cache = await caches.open(SW_VERSION);
-    const res = new Response(JSON.stringify(tasks), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-    await cache.put('/sw-tasks', res);
-  } catch (e) {}
+    const c = await caches.open(CACHE);
+    const r = await c.match('/~tasks');
+    return r ? r.json() : [];
+  } catch { return []; }
 }
-
-async function getTasks() {
+async function savePos(lat, lng) {
+  const c = await caches.open(CACHE);
+  await c.put('/~pos', new Response(JSON.stringify({ lat, lng }),
+    { headers: { 'Content-Type': 'application/json' } }));
+}
+async function loadPos() {
   try {
-    const cache = await caches.open(SW_VERSION);
-    const res = await cache.match('/sw-tasks');
-    if (res) return await res.json();
-  } catch (e) {}
-  return [];
+    const c = await caches.open(CACHE);
+    const r = await c.match('/~pos');
+    return r ? r.json() : null;
+  } catch { return null; }
 }
 
-async function storeLastPos(lat, lng) {
-  try {
-    const cache = await caches.open(SW_VERSION);
-    const res = new Response(JSON.stringify({ lat, lng, t: Date.now() }), {
-      headers: { 'Content-Type': 'application/json' }
-    });
-    await cache.put('/sw-lastpos', res);
-  } catch (e) {}
-}
-
-async function getLastPos() {
-  try {
-    const cache = await caches.open(SW_VERSION);
-    const res = await cache.match('/sw-lastpos');
-    if (res) return await res.json();
-  } catch (e) {}
-  return null;
-}
-
-/* ════════════════════════════════════════════
-   HAVERSINE
-════════════════════════════════════════════ */
-function haversine(lat1, lng1, lat2, lng2) {
-  const R = 6371000;
-  const dLat = (lat2 - lat1) * Math.PI / 180;
-  const dLng = (lng2 - lng1) * Math.PI / 180;
-  const a = Math.sin(dLat/2)**2 +
-    Math.cos(lat1*Math.PI/180) * Math.cos(lat2*Math.PI/180) * Math.sin(dLng/2)**2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+/* ── Haversine ── */
+function haversine(a, b, c, d) {
+  const R = 6371000, f = Math.PI / 180;
+  const x = Math.sin((c-a)*f/2)**2 +
+    Math.cos(a*f)*Math.cos(c*f)*Math.sin((d-b)*f/2)**2;
+  return 2*R*Math.atan2(Math.sqrt(x), Math.sqrt(1-x));
 }
